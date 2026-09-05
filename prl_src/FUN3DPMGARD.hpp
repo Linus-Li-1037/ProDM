@@ -20,6 +20,7 @@
 #include "utils.hpp"
 #include "MDR/Writer/WriterInterface.hpp"
 #include "MDR/Retriever/RetrieverInterface.hpp"
+#include "MDR/SizeInterpreter/SizeInterpreterInterface.hpp"
 #include "SingleFileArchive.hpp"
 
 namespace PMGARDFUN3D {
@@ -378,6 +379,10 @@ public:
 
     const FrameInfo& info() const { return info_; }
     uint64_t block() const { return block_; }
+    // The block's whole metadata (FrameInfo, MDR's, and whatever a retrieve stage
+    // appended) and where its components sit, for a retrieve stage that copies prefixes.
+    const std::vector<uint8_t>& block_metadata() const { return block_metadata_; }
+    const SingleFileBlockLayout& layout() const { return layout_; }
 
     std::vector<std::vector<const uint8_t*>> retrieve_level_components(
         const std::vector<std::vector<uint32_t>>& level_sizes,
@@ -450,6 +455,125 @@ private:
     std::vector<std::vector<uint8_t>> buffers_;
     FrameInfo info_;
     uint64_t block_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Retrieve-then-transfer.  A retrieve stage on the source cluster decides what one
+// tolerance needs, fetches exactly that, and writes it as a BUNDLE: the same archive
+// layout, one file per rank, every level cut down to the planes taken.  The bundle is
+// what gets transferred; a reconstruct stage on the other cluster reads it and decodes.
+// PMGARD needs no mesh, so only metadata.json travels beside it.
+// ---------------------------------------------------------------------------
+
+inline std::string retrieved_archive_name(const std::string& directory, int np, int rank) {
+    std::string result = directory;
+    if (!result.empty() && result.back() != '/') result += '/';
+    return result + "pmgard.retrieved.p" + std::to_string(np) + ".rank" +
+           std::to_string(rank) + ".bin";
+}
+
+inline void put_f64(uint8_t*& pos, double value) {
+    std::memcpy(pos, &value, sizeof(value));
+    pos += sizeof(value);
+}
+inline double get_f64(const uint8_t*& pos) {
+    double value = 0;
+    std::memcpy(&value, pos, sizeof(value));
+    pos += sizeof(value);
+    return value;
+}
+
+// What the retrieve stage decided for one frame.  It rides at the END of the block's
+// metadata in the bundle -- after FrameInfo and MDR's metadata, which MDR deserializes
+// from the front and never looks past -- followed by its own byte count, so the
+// reconstruct stage peels it off the tail and decodes exactly `taken[L]` planes of
+// level L instead of re-running the size interpreter on another machine's arithmetic.
+struct RetrievalRecord {
+    static constexpr uint64_t MAGIC = 0x3143455256525452ULL;   // "RTRVREC1" in file order
+
+    double rel_tolerance = 0;
+    double abs_tolerance = 0;
+    std::vector<uint64_t> taken;   // per level: bitplanes shipped
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out(4 * sizeof(uint64_t) + taken.size() * sizeof(uint64_t));
+        uint8_t* pos = out.data();
+        sfa_put(pos, MAGIC);
+        put_f64(pos, rel_tolerance);
+        put_f64(pos, abs_tolerance);
+        sfa_put(pos, static_cast<uint64_t>(taken.size()));
+        for (uint64_t t : taken) sfa_put(pos, t);
+        return out;
+    }
+
+    bool deserialize(const uint8_t* data, size_t size) {
+        if (size < 4 * sizeof(uint64_t)) return false;
+        const uint8_t* pos = data;
+        if (sfa_get(pos) != MAGIC) return false;
+        rel_tolerance = get_f64(pos);
+        abs_tolerance = get_f64(pos);
+        const uint64_t count = sfa_get(pos);
+        if (size != 4 * sizeof(uint64_t) + count * sizeof(uint64_t)) return false;
+        taken.resize(count);
+        for (auto& t : taken) t = sfa_get(pos);
+        return true;
+    }
+};
+
+// bundle metadata = block metadata ++ record ++ uint64(record bytes)
+inline std::vector<uint8_t> append_record(const std::vector<uint8_t>& metadata,
+                                          const RetrievalRecord& record) {
+    const auto bytes = record.serialize();
+    std::vector<uint8_t> out(metadata);
+    out.insert(out.end(), bytes.begin(), bytes.end());
+    uint8_t tail[sizeof(uint64_t)];
+    uint8_t* pos = tail;
+    sfa_put(pos, static_cast<uint64_t>(bytes.size()));
+    out.insert(out.end(), tail, tail + sizeof(tail));
+    return out;
+}
+
+// Inverse: peels the record off the tail.
+inline bool split_record(const std::vector<uint8_t>& bundle_metadata,
+                         RetrievalRecord& record) {
+    if (bundle_metadata.size() < sizeof(uint64_t)) return false;
+    const uint8_t* pos = bundle_metadata.data() + bundle_metadata.size() - sizeof(uint64_t);
+    const uint64_t record_size = sfa_get(pos);
+    if (record_size + sizeof(uint64_t) > bundle_metadata.size()) return false;
+    return record.deserialize(
+        bundle_metadata.data() + bundle_metadata.size() - sizeof(uint64_t) - record_size,
+        record_size);
+}
+
+// A size interpreter that hands back a decision made elsewhere -- the bitplane counts
+// the retrieve stage recorded.  Reconstructing from a bundle uses this in place of the
+// greedy interpreter, so the planes decoded are exactly the planes shipped.  The
+// tolerance argument is ignored.
+class FixedPlanInterpreter : public MDR::concepts::SizeInterpreterInterface {
+public:
+    explicit FixedPlanInterpreter(std::vector<uint8_t> planes) : planes_(std::move(planes)) {}
+
+    std::vector<uint32_t> interpret_retrieve_size(
+        const std::vector<std::vector<uint32_t>>& level_sizes,
+        const std::vector<std::vector<double>>&, double,
+        std::vector<uint8_t>& index) const override {
+        std::vector<uint32_t> sizes(level_sizes.size(), 0);
+        for (size_t level = 0; level < level_sizes.size(); ++level) {
+            const uint8_t target = level < planes_.size() ? planes_[level] : 0;
+            for (int plane = index[level];
+                 plane < target && static_cast<size_t>(plane) < level_sizes[level].size();
+                 ++plane) {
+                sizes[level] += level_sizes[level][plane];
+            }
+            if (target > index[level]) index[level] = target;
+        }
+        return sizes;
+    }
+
+    void print() const override {}
+
+private:
+    std::vector<uint8_t> planes_;
 };
 
 }  // namespace PMGARDFUN3D

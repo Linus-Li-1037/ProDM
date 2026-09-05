@@ -23,6 +23,24 @@ namespace MDR {
         T * reconstruct(double tolerance){
             return reconstruct(tolerance, -1);
         }
+
+        // Retrieval planning alone: the bitplanes of each level `tolerance` costs,
+        // starting from nothing, and the bytes that is per level -- without decoding
+        // and without touching this object's state.  A retrieve stage that writes a
+        // bundle for another cluster runs this; reconstruct() is the same decision
+        // followed by the decode.  Call load_metadata() first.
+        std::vector<uint32_t> plan_retrieval(double tolerance, std::vector<uint8_t>& planes) const {
+            std::vector<std::vector<double>> level_errors = level_squared_errors;
+            if(std::is_base_of<MaxErrorEstimator<T>, ErrorEstimator>::value){
+                MaxErrorCollector<T> collector = MaxErrorCollector<T>();
+                level_errors.clear();
+                for(size_t i=0; i<level_error_bounds.size(); i++){
+                    level_errors.push_back(collector.collect_level_error(NULL, 0, level_sizes[i].size(), level_error_bounds[i]));
+                }
+            }
+            planes.assign(level_error_bounds.size(), 0);
+            return interpreter.interpret_retrieve_size(level_sizes, level_errors, tolerance, planes);
+        }
         // reconstruct data from encoded streams
         T * reconstruct(double tolerance, int max_level=-1){
             // Timer timer;
